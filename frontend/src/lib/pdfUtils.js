@@ -558,6 +558,17 @@ const wrapTextToWidth = (text, measure, size, maxWidth) => {
   return out.length ? out : [''];
 };
 
+// Shrink a font size down until the whole (single-line) text fits maxWidth, so
+// an edited run keeps its ORIGINAL vertical footprint (one line) instead of
+// wrapping downward onto — and overlapping — the following text.
+const fitSizeToWidth = (text, measure, size, maxWidth, minSize = 4) => {
+  const t = String(text == null ? '' : text).replace(/\n/g, ' ');
+  if (!maxWidth || maxWidth <= 1 || !t) return size;
+  let s = size;
+  while (s > minSize && measure(t, s) > maxWidth) s -= 0.5;
+  return s;
+};
+
 // Apply a list of styled text edits to the original PDF and return saved bytes.
 // edits: [{ pageIndex, xPt, yPt, widthPt, bg, text, family, bold, italic, underline, size, color, align }]
 export const applyPdfTextEdits = async (file, edits) => {
@@ -585,11 +596,11 @@ export const applyPdfTextEdits = async (file, edits) => {
       try { return font.widthOfTextAtSize(t, sz); } catch { return (t.length * sz * 0.5); }
     };
     let size = e.size || 12;
-    // Keep the ORIGINAL font size and wrap wide text onto extra lines instead
-    // of shrinking it, so an edited/converted run never overflows or mismatches
-    // the surrounding text size.
+    // Shrink the edited run to fit its original box width on a SINGLE line so it
+    // never wraps downward onto (and overlaps) the following text.
     const boxW = e.widthPt && e.widthPt > 1 ? e.widthPt : measure(text, size);
-    const lines = wrapTextToWidth(text, measure, size, boxW);
+    size = fitSizeToWidth(text, measure, size, boxW);
+    const lines = [String(text == null ? '' : text).replace(/\n/g, ' ')];
     const lineHeight = size * 1.32;
     const lineWidths = lines.map((l) => measure(l, size));
     const maxLineW = Math.max(0, ...lineWidths);
@@ -661,9 +672,16 @@ export const applyPdfEdits = async (file, { texts = [], shapes = [], images = []
     const font = needsUnicodeFont(text) ? await getUniFont() : await pick(e);
     const measure = (t, sz) => { try { return font.widthOfTextAtSize(t, sz); } catch { return t.length * sz * 0.5; } };
     let size = e.size || 12;
-    // Keep original size; wrap wide text onto extra lines (see applyPdfTextEdits).
+    // Existing edited runs (with a cover box) shrink-to-fit on one line so they
+    // don't overlap the following text; brand-new free text boxes keep wrapping.
     const boxW = e.widthPt && e.widthPt > 1 ? e.widthPt : measure(text, size);
-    const lines = wrapTextToWidth(text, measure, size, boxW);
+    let lines;
+    if (e.noBg) {
+      lines = wrapTextToWidth(text, measure, size, boxW);
+    } else {
+      size = fitSizeToWidth(text, measure, size, boxW);
+      lines = [String(text == null ? '' : text).replace(/\n/g, ' ')];
+    }
     const lineHeight = size * 1.32;
     const lineWidths = lines.map((l) => measure(l, size));
     const maxLineW = Math.max(0, ...lineWidths);

@@ -591,19 +591,23 @@ const EditPdfPage = () => {
                         // height (it.fontPx) by (current size / baseline size). When
                         // unchanged this factor is 1 -> no size jump on click/edit.
                         const baseSize = Math.max(6, Math.round(it.sizePt));
-                        // Keep the on-page glyph size IDENTICAL to the original
-                        // (scaled only when the user manually changes the size).
-                        // No shrink-to-fit: text now keeps its original size and
-                        // wraps onto extra lines on export instead of shrinking.
-                        const fontPx = it.fontPx * (st.size / baseSize);
+                        // Shrink-to-fit: keep the edited run on its ORIGINAL single
+                        // line by scaling the glyph size down so the (possibly longer
+                        // or wider) text fits its original box width. This mirrors the
+                        // export so the following text never gets overlapped.
+                        let fontPx = it.fontPx * (st.size / baseSize);
+                        const boxW = Math.max(it.widthPx, 14);
+                        if (text) {
+                          let mw = measureTextWidthPx(text, fontPx * 0.92, st);
+                          while (mw > boxW && fontPx > 4) {
+                            fontPx -= 0.5;
+                            mw = measureTextWidthPx(text, fontPx * 0.92, st);
+                          }
+                        }
                         const baselinePx = it.top + it.fontPx;
                         const top = baselinePx - fontPx;
                         if (active) {
-                          // Auto-fit the edit box to the text: when a word/line is
-                          // longer or larger than the original box, grow the input
-                          // so nothing gets clipped and the line stays natural.
-                          const measured = measureTextWidthPx(text, fontPx * 0.92, st) + 8;
-                          const w = Math.max(it.widthPx, fontPx, measured, 14);
+                          const w = Math.max(boxW, fontPx, 14);
                           return (
                             <input key={it.id} value={text} data-testid="pdf-text-input"
                               onChange={(e) => patchText(it.id, e.target.value)}
