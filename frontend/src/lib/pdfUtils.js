@@ -452,16 +452,30 @@ const classifyFont = (name = '') => {
 // (joined with a space so the paragraph re-flows), short lines keep a hard break.
 export const buildTextBlocks = (items, ptW, scale, pageIndex = 0) => {
   if (!items || !items.length) return [];
-  // 1) group runs into lines by baseline
-  const lines = [];
+  // 1) group runs into rows by baseline
+  const rows = [];
   [...items].sort((a, b) => b.yPt - a.yPt).forEach((it) => {
     const tol = Math.max(1.5, (it.sizePt || 10) * 0.45);
-    let line = lines.find((L) => Math.abs(L.yPt - it.yPt) <= tol);
-    if (!line) { line = { yPt: it.yPt, runs: [] }; lines.push(line); }
-    line.runs.push(it);
+    let row = rows.find((R) => Math.abs(R.yPt - it.yPt) <= tol);
+    if (!row) { row = { yPt: it.yPt, runs: [] }; rows.push(row); }
+    row.runs.push(it);
   });
-  lines.forEach((L) => {
-    L.runs.sort((a, b) => a.xPt - b.xPt);
+  // 2) split each row into cells wherever there is a large horizontal gap
+  //    (a tab-stop / column boundary — e.g. "Parent Exchange:"  ....  value).
+  const cells = [];
+  rows.forEach((row) => {
+    row.runs.sort((a, b) => a.xPt - b.xPt);
+    let cell = null;
+    for (const r of row.runs) {
+      const gapThreshold = Math.max((r.sizePt || 10) * 1.8, 18);
+      if (cell && (r.xPt - cell.right) > gapThreshold) { cells.push(cell); cell = null; }
+      if (!cell) cell = { yPt: row.yPt, runs: [] };
+      cell.runs.push(r);
+      cell.right = r.xPt + (r.widthPt || 0);
+    }
+    if (cell) cells.push(cell);
+  });
+  cells.forEach((L) => {
     L.left = Math.min(...L.runs.map((r) => r.xPt));
     L.right = Math.max(...L.runs.map((r) => r.xPt + (r.widthPt || 0)));
     L.size = Math.max(...L.runs.map((r) => r.sizePt || 0));
@@ -470,13 +484,13 @@ export const buildTextBlocks = (items, ptW, scale, pageIndex = 0) => {
     L.leftPx = Math.min(...L.runs.map((r) => r.left));
     L.topPx = Math.min(...L.runs.map((r) => r.top));
     L.rightPx = Math.max(...L.runs.map((r) => r.left + r.widthPx));
-    L.bottomPx = Math.max(...L.runs.map((r) => r.top + r.fontPx * 1.25));
+    L.bottomPx = Math.max(...L.runs.map((r) => r.top + r.fontPx * 1.3));
   });
-  lines.sort((a, b) => b.yPt - a.yPt);
-  // 2) merge lines into blocks
+  cells.sort((a, b) => b.yPt - a.yPt);
+  // 3) merge vertically adjacent, left-aligned, same-size/colour cells into blocks
   const groups = [];
   let cur = null;
-  for (const L of lines) {
+  for (const L of cells) {
     if (!cur) { cur = [L]; groups.push(cur); continue; }
     const prev = cur[cur.length - 1];
     const gap = prev.yPt - L.yPt;
@@ -487,7 +501,7 @@ export const buildTextBlocks = (items, ptW, scale, pageIndex = 0) => {
     if (sameLeft && sameSize && sameColor && adjacent) cur.push(L);
     else { cur = [L]; groups.push(cur); }
   }
-  // 3) finalize
+  // 4) finalize
   return groups.map((ls, n) => {
     const left = Math.min(...ls.map((l) => l.left));
     const right = Math.max(...ls.map((l) => l.right));
@@ -496,13 +510,30 @@ export const buildTextBlocks = (items, ptW, scale, pageIndex = 0) => {
     const widthPt = Math.max(right - left, size * 2);
     const fams = ls.flatMap((l) => l.runs.map((r) => (r.mono ? 'mono' : r.serif ? 'serif' : 'sans')));
     const family = fams.sort((a, b) => fams.filter((v) => v === a).length - fams.filter((v) => v === b).length).pop() || 'sans';
-    const linesSeg = ls.map((l) => l.runs.map((r) => ({ text: r.str, bold: !!r.bold, italic: !!r.italic })));
+    // Rebuild each cell's segments, restoring inter-word spaces from x-gaps
+    // (pdf.js often emits each word as a separate run with no space char).
+    const mkSegs = (cell) => cell.runs.map((r, i) => {
+      let text = r.str;
+      if (i > 0) {
+        const prev = cell.runs[i - 1];
+        const gap = r.xPt - (prev.xPt + (prev.widthPt || 0));
+        if (gap > (r.sizePt || 10) * 0.06 && !/\s$/.test(prev.str) && !/^\s/.test(r.str)) text = ' ' + text;
+      }
+      return { text, bold: !!r.bold, italic: !!r.italic };
+    });
+    const linesSeg = ls.map(mkSegs);
     const softJoin = ls.map((l, idx) => (idx === 0 ? false : ls[idx - 1].right >= right - Math.max(size * 1.6, (right - left) * 0.08)));
+    // tight per-line boxes (original text extents) used to cover only the old
+    // glyphs on export — leaving the page background / watermark untouched.
+    const origLines = ls.map((l) => ({
+      xPt: l.left, baselineYpt: l.yPt, rightPt: l.right, size: l.size,
+      leftPx: l.leftPx, topPx: l.topPx, rightPx: l.rightPx, bottomPx: l.bottomPx,
+    }));
     return {
       id: `b-${pageIndex}-${n}`, pageIndex,
       xPt: left, firstBaselineYpt: ls[0].yPt, lineHeightPt, widthPt,
       size, nLines: ls.length, color: ls[0].color, bg: ls[0].bg, family,
-      linesSeg, softJoin,
+      linesSeg, softJoin, origLines,
       // preview-px geometry for the on-page editable overlay
       leftPx: Math.min(...ls.map((l) => l.leftPx)),
       topPx: Math.min(...ls.map((l) => l.topPx)),
@@ -766,14 +797,26 @@ export const applyPdfEdits = async (file, { texts = [], shapes = [], images = []
     const spaceFont = await fontBI(false, false);
     const spaceW = spaceFont.widthOfTextAtSize(' ', size);
 
-    // cover original glyphs
-    const coverTop = b.firstBaselineYpt + size * 0.92;
-    const coverBottom = b.firstBaselineYpt - Math.max(0, (b.nLines || 1) - 1) * lineHeight - size * 0.42;
-    page.drawRectangle({
-      x: b.xPt - 2, y: coverBottom,
-      width: (b.widthPt || size * 4) + 4, height: coverTop - coverBottom,
-      color: hexToRgb(b.bg || '#ffffff'),
-    });
+    // Prefer a reconstructed background patch (watermark/logo preserved, old
+    // glyphs inpainted away) so the edit is seamless. Fall back to a tight
+    // white cover only when no patch was supplied.
+    if (b.bgPatch && b.bgPatch.dataUrl) {
+      try {
+        const png = await docPdf.embedPng(b.bgPatch.dataUrl);
+        page.drawImage(png, { x: b.bgPatch.x, y: b.bgPatch.y, width: b.bgPatch.w, height: b.bgPatch.h });
+      } catch (e) { /* fall back below */ }
+    } else {
+      const covers = (b.origLines && b.origLines.length)
+        ? b.origLines
+        : [{ xPt: b.xPt, baselineYpt: b.firstBaselineYpt, rightPt: b.xPt + (b.widthPt || size * 4), size }];
+      for (const ol of covers) {
+        page.drawRectangle({
+          x: ol.xPt - 1, y: ol.baselineYpt - (ol.size || size) * 0.3,
+          width: Math.max(2, (ol.rightPt - ol.xPt) + 2), height: (ol.size || size) * 1.34,
+          color: hexToRgb(b.bg || '#ffffff'),
+        });
+      }
+    }
 
     let y = b.firstBaselineYpt;
     for (const hardLine of (b.lines || [])) {

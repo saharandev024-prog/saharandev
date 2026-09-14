@@ -1,0 +1,24 @@
+{
+  "summary": "Frontend-only testing of Edit PDF tool at /tool/edit-pdf using the provided sample PDF. Verified: (a) upload → 14 dashed pdf-block elements rendered, (b) clicking a block shows contentEditable pdf-block-input plus Edit Text panel with bold/italic/size-/size-input/size+/reset controls (feature #2 size control confirmed present), (c) targeted the 'D.E.E. Sirsa - Room No.- 72-74, 2nd Floor, Mini Secretariat, Barnala Road, Sirsa' value block – its left position stayed at x=782.47px before and after typing ' X' (does NOT jump/merge with the 'Parent Exchange:' label; second line 'Secretariat, Barnala Road, Sirsa' remained on its own line without squishing), (d) size +/- changed on-page size from 12 → 15, (e) Save changes button downloaded a valid 187,785-byte edited PDF, (f) rendered edited PDF with pdftoppm and pixel-inspected against original: RED WATERMARK PIXELS ARE PRESERVED BIT-EXACTLY (13084 red pixels in orig == 13084 in edited, 100% preservation ratio, 0 new-white pixels erasing watermark). In the diff bbox (294,713,670,781), the edited region has 45% white / 55% non-white content (14024 non-white pixels vs 11757 in original) confirming the background is inpainted/reconstructed rather than covered with a solid white rectangle. No page/JS errors captured during upload, editing, size change, or save.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "EditPdfPage.jsx is 875 lines — nearing the 700-line threshold; consider splitting EditableBlock, buildBgPatches, and panel renderers into separate modules.",
+    "buildBgPatches inpaint loop is O(N*passes*9) per block on the main thread; for large pages/many blocks this can freeze the UI. Consider moving to a Web Worker or OffscreenCanvas.",
+    "measureTextWidthPx uses a module-level singleton canvas — fine, but not thread-safe if this ever moves to a worker.",
+    "In save(), errors are swallowed into a generic 'Something went wrong' toast — logging the caught error to console would help future debugging."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "n/a", "frontend": "100%"},
+  "seed_data_creation": "Downloaded provided test PDF to /tmp/test_edit.pdf; downloaded edited output to /tmp/dl/edited_output.pdf.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Sample PDF at /tmp/test_edit.pdf, edited output at /tmp/dl/edited_output.pdf, page rasters at /tmp/dl/orig-1.ppm and /tmp/dl/edited-1.ppm. The 'D.E.E. Sirsa' block is at index 9 among data-testid='pdf-block' elements. Watermark pixel signature: red pixels satisfying (R>180)&(G<210)&(B<210)&((R-G)>25)&((R-B)>25) — orig has 13084 such pixels on page 1.",
+  "rca of the issue": "Primary bug (solid white box erasing watermark) fixed: applyPdfEdits now uses buildBgPatches() to inpaint each block's original glyph pixels while preserving the watermark, then embeds that PNG (see EditPdfPage.jsx buildBgPatches and pdfUtils.js applyPdfEdits block loop) instead of drawing a white cover rectangle. Bug (b) label/value merge fixed by buildTextBlocks splitting rows into columns on large x-gaps (verified: value block left didn't shift). Feature (2) size control present and functional (block-size-minus/input/plus)."
+}

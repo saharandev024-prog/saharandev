@@ -105,7 +105,87 @@ const parseEditable = (root) => {
   return cleaned.length ? cleaned : [[]];
 };
 
-const EditableBlock = ({ block, selected, touched, editedLines, onSelect, onChange }) => {
+// Load an image (data URL) to an <img> element.
+const loadImg = (src) => new Promise((resolve, reject) => {
+  const im = new Image(); im.crossOrigin = 'anonymous';
+  im.onload = () => resolve(im); im.onerror = reject; im.src = src;
+});
+
+// Reconstruct the page background under each edited block's original text by
+// inpainting away the dark/coloured glyph pixels while keeping the light
+// watermark/logo — returns { [blockId]: { dataUrl, x, y, w, h } } in PDF points.
+const buildBgPatches = async (blocks, preview) => {
+  const out = {};
+  if (!blocks || !blocks.length || !preview || !preview.dataUrl) return out;
+  let img;
+  try { img = await loadImg(preview.dataUrl); } catch (e) { return out; }
+  const scale = preview.pxW / preview.ptW;
+  const ptH = preview.ptH;
+  const full = document.createElement('canvas');
+  full.width = preview.pxW; full.height = preview.pxH;
+  const fctx = full.getContext('2d');
+  fctx.drawImage(img, 0, 0, preview.pxW, preview.pxH);
+
+  for (const b of blocks) {
+    const lines = b.origLines || [];
+    if (!lines.length) continue;
+    const pad = Math.max(3, b.sizePx * 0.35);
+    let x0 = Math.min(...lines.map((l) => l.leftPx)) - pad;
+    let y0 = Math.min(...lines.map((l) => l.topPx)) - pad;
+    let x1 = Math.max(...lines.map((l) => l.rightPx)) + pad;
+    let y1 = Math.max(...lines.map((l) => l.bottomPx)) + pad;
+    x0 = Math.max(0, Math.floor(x0)); y0 = Math.max(0, Math.floor(y0));
+    x1 = Math.min(preview.pxW, Math.ceil(x1)); y1 = Math.min(preview.pxH, Math.ceil(y1));
+    const w = x1 - x0, h = y1 - y0;
+    if (w <= 1 || h <= 1) continue;
+
+    const data = fctx.getImageData(x0, y0, w, h);
+    const d = data.data; const N = w * h;
+    // mark glyph pixels (darker than the light watermark/background)
+    const isText = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      const r = d[i * 4], g = d[i * 4 + 1], bch = d[i * 4 + 2];
+      const lum = 0.299 * r + 0.587 * g + 0.114 * bch;
+      isText[i] = lum < 170 ? 1 : 0;
+    }
+    // dilate background inward to fill the glyph pixels (simple inpaint)
+    for (let pass = 0; pass < 40; pass++) {
+      let changed = 0;
+      const snap = isText.slice();
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = y * w + x;
+          if (!snap[i]) continue;
+          let rs = 0, gs = 0, bs = 0, c = 0;
+          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+            const nx = x + dx, ny = y + dy;
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+            const j = ny * w + nx;
+            if (!snap[j]) { rs += d[j * 4]; gs += d[j * 4 + 1]; bs += d[j * 4 + 2]; c++; }
+          }
+          if (c > 0) { d[i * 4] = rs / c; d[i * 4 + 1] = gs / c; d[i * 4 + 2] = bs / c; d[i * 4 + 3] = 255; isText[i] = 0; changed++; }
+        }
+      }
+      if (!changed) break;
+    }
+    // any still-unfilled glyph pixel -> white
+    for (let i = 0; i < N; i++) if (isText[i]) { d[i * 4] = 255; d[i * 4 + 1] = 255; d[i * 4 + 2] = 255; d[i * 4 + 3] = 255; }
+
+    const patch = document.createElement('canvas');
+    patch.width = w; patch.height = h;
+    patch.getContext('2d').putImageData(data, 0, 0);
+    out[b.id] = {
+      dataUrl: patch.toDataURL('image/png'),
+      x: x0 / scale,
+      y: ptH - y1 / scale,
+      w: w / scale,
+      h: h / scale,
+    };
+  }
+  return out;
+};
+
+const EditableBlock = ({ block, selected, touched, editedLines, fontScale = 1, onSelect, onChange }) => {
   const ref = useRef(null);
   const initialHtml = touched && editedLines ? editedToHtml(editedLines) : editedToHtml(blockInitialLines(block));
   useEffect(() => {
@@ -115,11 +195,12 @@ const EditableBlock = ({ block, selected, touched, editedLines, onSelect, onChan
       ref.current.focus();
     }
   }, [selected, initialHtml]);
+  const lh = (block.lineHeightPx || block.sizePx * 1.3) * fontScale;
   const base = {
     position: 'absolute', left: block.leftPx, top: block.topPx,
     width: block.widthPx,
-    minHeight: Math.max(0, (block.nLines || 1) - 1) * (block.lineHeightPx || block.sizePx * 1.3) + block.sizePx * 1.25,
-    fontSize: block.sizePx * 0.92, lineHeight: `${block.lineHeightPx || block.sizePx * 1.3}px`,
+    minHeight: Math.max(0, (block.nLines || 1) - 1) * lh + block.sizePx * 1.25 * fontScale,
+    fontSize: block.sizePx * 0.92 * fontScale, lineHeight: `${lh}px`,
     fontFamily: famCss(block.family), color: block.color || '#0f172a',
     textAlign: 'left', whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word',
   };
@@ -241,6 +322,7 @@ const EditPdfPage = () => {
     setBlockEdits((prev) => (prev[b.id] ? prev : { ...prev, [b.id]: { block: b, editedLines: blockInitialLines(b), touched: false } }));
   };
   const patchBlock = (id, editedLines) => setBlockEdits((prev) => ({ ...prev, [id]: { ...prev[id], editedLines, touched: true } }));
+  const patchBlockSize = (id, size) => setBlockEdits((prev) => ({ ...prev, [id]: { ...prev[id], size, touched: true } }));
   const resetBlock = (id) => {
     setBlockEdits((prev) => { const n = { ...prev }; delete n[id]; return n; });
     if (selectedBlockId === id) setSelectedBlockId(null);
@@ -352,15 +434,24 @@ const EditPdfPage = () => {
     if (!changeCount) return;
     setBusy(true); setError('');
     try {
+      // Build seamless background patches (watermark/logo preserved, old glyphs
+      // inpainted) for every edited block, from the rendered page image.
+      const bgPatches = await buildBgPatches(touchedBlocks.map((e) => e.block), preview);
       // Edited paragraph/line blocks -> re-flowed styled text on export.
-      const blocks = touchedBlocks.map((e) => ({
-        pageIndex: e.block.pageIndex,
-        xPt: e.block.xPt, firstBaselineYpt: e.block.firstBaselineYpt,
-        lineHeightPt: e.block.lineHeightPt, widthPt: e.block.widthPt,
-        size: e.block.size, nLines: e.block.nLines,
-        color: e.block.color, bg: e.block.bg, family: e.block.family,
-        lines: (e.editedLines || []).map((line) => line.map((s) => ({ text: s.text, bold: !!s.bold, italic: !!s.italic }))),
-      }));
+      const blocks = touchedBlocks.map((e) => {
+        const eff = e.size || e.block.size;
+        const scaleFactor = e.block.size ? eff / e.block.size : 1;
+        return {
+          pageIndex: e.block.pageIndex,
+          xPt: e.block.xPt, firstBaselineYpt: e.block.firstBaselineYpt,
+          lineHeightPt: (e.block.lineHeightPt || eff * 1.3) * scaleFactor, widthPt: e.block.widthPt,
+          size: eff, nLines: e.block.nLines,
+          color: e.block.color, bg: e.block.bg, family: e.block.family,
+          origLines: e.block.origLines,
+          bgPatch: bgPatches[e.block.id] || null,
+          lines: (e.editedLines || []).map((line) => line.map((s) => ({ text: s.text, bold: !!s.bold, italic: !!s.italic }))),
+        };
+      });
       const shapes = objects.filter((o) => o.kind === 'shape').map((o) => ({ pageIndex: o.pageIndex, type: o.type, n: o.n, color: o.color, opacity: o.opacity, strokeWidth: o.strokeWidth, fill: o.fill }));
       const images = objects.filter((o) => o.kind === 'image').map((o) => ({ pageIndex: o.pageIndex, dataUrl: o.dataUrl, n: o.n }));
       // Brand-new text boxes -> text edits placed by normalized coords (no cover box).
@@ -427,6 +518,21 @@ const EditPdfPage = () => {
               className="grid place-items-center w-9 h-9 rounded-lg border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5"><Italic className="w-4 h-4" /></button>
           </div>
           <p className="text-xs text-slate-400 mt-1.5">Tip: highlight the words first, then tap B or I.</p>
+        </div>
+        <div>
+          <label className="block text-xs font-semibold text-slate-500 mb-1.5">Text size</label>
+          <div className="flex items-center rounded-lg border border-slate-200 dark:border-white/10 overflow-hidden w-36">
+            <button type="button" data-testid="block-size-minus" title="Smaller"
+              onClick={() => patchBlockSize(selectedBlockId, Math.max(4, Math.round((selectedBlockEntry.size || selectedBlockEntry.block.size)) - 1))}
+              className="px-2.5 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-white/5"><Minus className="w-4 h-4" /></button>
+            <input type="number" min={4} max={200} data-testid="block-size-input"
+              value={Math.round(selectedBlockEntry.size || selectedBlockEntry.block.size)}
+              onChange={(e) => patchBlockSize(selectedBlockId, Math.max(4, Math.min(200, parseInt(e.target.value || '0', 10) || 4)))}
+              className="w-full text-center text-sm bg-transparent outline-none py-2" />
+            <button type="button" data-testid="block-size-plus" title="Bigger"
+              onClick={() => patchBlockSize(selectedBlockId, Math.min(200, Math.round((selectedBlockEntry.size || selectedBlockEntry.block.size)) + 1))}
+              className="px-2.5 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-white/5"><Plus className="w-4 h-4" /></button>
+          </div>
         </div>
         <button type="button" data-testid="block-reset-btn" onClick={() => resetBlock(selectedBlockId)}
           className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-500 hover:text-rose-500"><RotateCcw className="w-4 h-4" /> Reset this block</button>
@@ -684,6 +790,7 @@ const EditPdfPage = () => {
                             selected={selected}
                             touched={!!touched}
                             editedLines={be ? be.editedLines : null}
+                            fontScale={be && be.size ? be.size / b.size : 1}
                             onSelect={() => selectBlock(b)}
                             onChange={(lines) => patchBlock(b.id, lines)}
                           />
