@@ -446,6 +446,73 @@ const classifyFont = (name = '') => {
   return { bold, italic, mono, serif };
 };
 
+// Group extracted text runs into paragraph / line "blocks" (LightPDF-style).
+// Lines that are vertically adjacent, share the same left margin, size and
+// colour are merged into one block. Full-width lines are treated as soft wraps
+// (joined with a space so the paragraph re-flows), short lines keep a hard break.
+export const buildTextBlocks = (items, ptW, scale, pageIndex = 0) => {
+  if (!items || !items.length) return [];
+  // 1) group runs into lines by baseline
+  const lines = [];
+  [...items].sort((a, b) => b.yPt - a.yPt).forEach((it) => {
+    const tol = Math.max(1.5, (it.sizePt || 10) * 0.45);
+    let line = lines.find((L) => Math.abs(L.yPt - it.yPt) <= tol);
+    if (!line) { line = { yPt: it.yPt, runs: [] }; lines.push(line); }
+    line.runs.push(it);
+  });
+  lines.forEach((L) => {
+    L.runs.sort((a, b) => a.xPt - b.xPt);
+    L.left = Math.min(...L.runs.map((r) => r.xPt));
+    L.right = Math.max(...L.runs.map((r) => r.xPt + (r.widthPt || 0)));
+    L.size = Math.max(...L.runs.map((r) => r.sizePt || 0));
+    L.color = L.runs[0].color;
+    L.bg = L.runs[0].bg;
+    L.leftPx = Math.min(...L.runs.map((r) => r.left));
+    L.topPx = Math.min(...L.runs.map((r) => r.top));
+    L.rightPx = Math.max(...L.runs.map((r) => r.left + r.widthPx));
+    L.bottomPx = Math.max(...L.runs.map((r) => r.top + r.fontPx * 1.25));
+  });
+  lines.sort((a, b) => b.yPt - a.yPt);
+  // 2) merge lines into blocks
+  const groups = [];
+  let cur = null;
+  for (const L of lines) {
+    if (!cur) { cur = [L]; groups.push(cur); continue; }
+    const prev = cur[cur.length - 1];
+    const gap = prev.yPt - L.yPt;
+    const sameLeft = Math.abs(L.left - cur[0].left) <= Math.max(9, ptW * 0.03);
+    const sameSize = Math.abs(L.size - prev.size) <= 2.2;
+    const sameColor = L.color === prev.color;
+    const adjacent = gap > 0 && gap <= prev.size * 2.2;
+    if (sameLeft && sameSize && sameColor && adjacent) cur.push(L);
+    else { cur = [L]; groups.push(cur); }
+  }
+  // 3) finalize
+  return groups.map((ls, n) => {
+    const left = Math.min(...ls.map((l) => l.left));
+    const right = Math.max(...ls.map((l) => l.right));
+    const size = Math.max(...ls.map((l) => l.size));
+    const lineHeightPt = ls.length > 1 ? (ls[0].yPt - ls[ls.length - 1].yPt) / (ls.length - 1) : size * 1.3;
+    const widthPt = Math.max(right - left, size * 2);
+    const fams = ls.flatMap((l) => l.runs.map((r) => (r.mono ? 'mono' : r.serif ? 'serif' : 'sans')));
+    const family = fams.sort((a, b) => fams.filter((v) => v === a).length - fams.filter((v) => v === b).length).pop() || 'sans';
+    const linesSeg = ls.map((l) => l.runs.map((r) => ({ text: r.str, bold: !!r.bold, italic: !!r.italic })));
+    const softJoin = ls.map((l, idx) => (idx === 0 ? false : ls[idx - 1].right >= right - Math.max(size * 1.6, (right - left) * 0.08)));
+    return {
+      id: `b-${pageIndex}-${n}`, pageIndex,
+      xPt: left, firstBaselineYpt: ls[0].yPt, lineHeightPt, widthPt,
+      size, nLines: ls.length, color: ls[0].color, bg: ls[0].bg, family,
+      linesSeg, softJoin,
+      // preview-px geometry for the on-page editable overlay
+      leftPx: Math.min(...ls.map((l) => l.leftPx)),
+      topPx: Math.min(...ls.map((l) => l.topPx)),
+      widthPx: widthPt * scale,
+      sizePx: size * scale,
+      lineHeightPx: lineHeightPt * scale,
+    };
+  });
+};
+
 // Render one page and return the rendered image + every text run on it with
 // preview-space geometry (for the overlay) and PDF-space geometry (for export).
 export const extractPageText = async (file, pageIndex = 0, previewWidth = 720) => {
@@ -465,6 +532,13 @@ export const extractPageText = async (file, pageIndex = 0, previewWidth = 720) =
 
   const tc = await page.getTextContent();
   const styles = tc.styles || {};
+  // Resolve the real base font name (e.g. "Helvetica-Bold") which pdf.js only
+  // exposes on the font object after rendering — getTextContent's fontFamily is
+  // a generic "sans-serif" and loses the bold/italic signal.
+  const realFontName = (fn) => {
+    try { if (page.commonObjs.has(fn)) { const f = page.commonObjs.get(fn); return (f && (f.name || f.fallbackName)) || ''; } } catch (e) { /* not ready */ }
+    return '';
+  };
   const pix = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
   const cw = canvas.width;
 
@@ -499,7 +573,7 @@ export const extractPageText = async (file, pageIndex = 0, previewWidth = 720) =
     const top = t[5] - fontPx;
     const widthPx = (it.width || 0) * scale || fontPx * (it.str.length * 0.5);
     const st = styles[it.fontName] || {};
-    const cls = classifyFont(st.fontFamily || it.fontName || '');
+    const cls = classifyFont(realFontName(it.fontName) || st.fontFamily || it.fontName || '');
     const { color, bg } = sampleColors(left, top, Math.max(widthPx, fontPx * 0.6), fontPx * 1.25);
     items.push({
       id: `${pageIndex}-${idx}`,
@@ -528,6 +602,7 @@ export const extractPageText = async (file, pageIndex = 0, previewWidth = 720) =
     ptH: vp1.height,
     total: doc.numPages,
     items,
+    blocks: buildTextBlocks(items, vp1.width, scale, pageIndex),
   };
 };
 
@@ -652,7 +727,7 @@ export const applyPdfTextEdits = async (file, edits) => {
 // texts: same shape as applyPdfTextEdits.
 // shapes: [{ pageIndex, type:'rect'|'line'|'highlight', n:{x,y,w,h}, color, opacity, strokeWidth, fill }]
 // images: [{ pageIndex, dataUrl, n:{x,y,w,h} }]
-export const applyPdfEdits = async (file, { texts = [], shapes = [], images = [] } = {}) => {
+export const applyPdfEdits = async (file, { texts = [], shapes = [], images = [], blocks = [] } = {}) => {
   const docPdf = await PDFDocument.load(await readFile(file), { ignoreEncryption: true });
   const pages = docPdf.getPages();
   const cache = {};
@@ -676,6 +751,60 @@ export const applyPdfEdits = async (file, { texts = [], shapes = [], images = []
       catch { page.drawText(str.replace(/[^\x20-\x7E]/g, '?'), { x, y, size, font, color: col }); }
     }
   };
+
+  // --- Block edits (paragraph/line blocks): cover the original block region and
+  // re-flow the edited, per-word-styled text within the block width. Bold/italic
+  // are preserved per word; family/size/colour are the block's. ---
+  for (const b of blocks) {
+    const page = pages[b.pageIndex];
+    if (!page) continue;
+    const size = b.size || 12;
+    const lineHeight = b.lineHeightPt || size * 1.3;
+    const family = b.family || 'sans';
+    const col = hexToRgb(b.color || '#0f172a');
+    const fontBI = async (bold, italic) => pick({ family, bold, italic });
+    const spaceFont = await fontBI(false, false);
+    const spaceW = spaceFont.widthOfTextAtSize(' ', size);
+
+    // cover original glyphs
+    const coverTop = b.firstBaselineYpt + size * 0.92;
+    const coverBottom = b.firstBaselineYpt - Math.max(0, (b.nLines || 1) - 1) * lineHeight - size * 0.42;
+    page.drawRectangle({
+      x: b.xPt - 2, y: coverBottom,
+      width: (b.widthPt || size * 4) + 4, height: coverTop - coverBottom,
+      color: hexToRgb(b.bg || '#ffffff'),
+    });
+
+    let y = b.firstBaselineYpt;
+    for (const hardLine of (b.lines || [])) {
+      // build styled words
+      const words = [];
+      for (const seg of hardLine) {
+        (seg.text || '').split(/\s+/).filter((w) => w !== '').forEach((w) => {
+          words.push({ text: w, bold: !!seg.bold, italic: !!seg.italic });
+        });
+      }
+      if (!words.length) { y -= lineHeight; continue; }
+      // measure + assign fonts
+      for (const wd of words) {
+        wd.font = needsUnicodeFont(wd.text) ? await getUniFont() : await fontBI(wd.bold, wd.italic);
+        wd.w = wd.font.widthOfTextAtSize(wd.text, size);
+      }
+      // greedy wrap within block width
+      let cur = [], curW = 0;
+      const flush = async () => {
+        let x = b.xPt;
+        for (const wd of cur) { await drawTextSafe(page, wd.text, x, y, size, wd.font, col); x += wd.w + spaceW; }
+        y -= lineHeight;
+      };
+      for (const wd of words) {
+        if (cur.length && (curW + spaceW + wd.w) > (b.widthPt || 1e9)) { await flush(); cur = []; curW = 0; }
+        cur.push(wd);
+        curW += (cur.length > 1 ? spaceW : 0) + wd.w;
+      }
+      if (cur.length) await flush();
+    }
+  }
 
   for (const e of texts) {
     const page = pages[e.pageIndex];

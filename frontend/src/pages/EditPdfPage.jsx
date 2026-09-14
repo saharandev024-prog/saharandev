@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useRef, useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import {
   ChevronRight, Save, Download, Loader2, X, CheckCircle2, MousePointerClick,
@@ -58,6 +58,93 @@ const deriveStyle = (it) => ({
   align: 'left',
 });
 
+// ---- Block (paragraph/line) editing helpers ----
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const segHtml = (seg) => {
+  let t = esc(seg.text);
+  if (seg.italic) t = `<i>${t}</i>`;
+  if (seg.bold) t = `<b>${t}</b>`;
+  return t;
+};
+// Hard-lines (array of arrays of {text,bold,italic}) -> HTML with <br> breaks.
+const editedToHtml = (lines) => (lines || []).map((line) => line.map(segHtml).join('') || '&nbsp;').join('<br>');
+// A block's original content -> hard-lines, merging soft-wrapped lines with a space.
+const blockInitialLines = (b) => {
+  const out = [];
+  (b.linesSeg || []).forEach((segs, idx) => {
+    const clone = segs.map((s) => ({ ...s }));
+    if (idx > 0 && b.softJoin && b.softJoin[idx] && out.length) {
+      out[out.length - 1].push({ text: ' ', bold: false, italic: false }, ...clone);
+    } else {
+      out.push(clone);
+    }
+  });
+  return out.length ? out : [[{ text: '', bold: false, italic: false }]];
+};
+// Parse a contentEditable element back into hard-lines with bold/italic per run.
+const parseEditable = (root) => {
+  const lines = [[]];
+  const push = (text, bold, italic) => { if (text) lines[lines.length - 1].push({ text, bold, italic }); };
+  const walk = (node, bold, italic) => {
+    node.childNodes.forEach((ch) => {
+      if (ch.nodeType === 3) { push(ch.nodeValue, bold, italic); return; }
+      if (ch.nodeType !== 1) return;
+      const tag = ch.tagName;
+      if (tag === 'BR') { lines.push([]); return; }
+      const isBlock = tag === 'DIV' || tag === 'P';
+      if (isBlock && lines[lines.length - 1].length) lines.push([]);
+      const st = ch.style || {};
+      const b = bold || tag === 'B' || tag === 'STRONG' || st.fontWeight === 'bold' || parseInt(st.fontWeight, 10) >= 600;
+      const i = italic || tag === 'I' || tag === 'EM' || st.fontStyle === 'italic';
+      walk(ch, b, i);
+      if (isBlock && lines[lines.length - 1].length) lines.push([]);
+    });
+  };
+  walk(root, false, false);
+  const cleaned = lines.filter((l, idx) => l.length || idx === 0);
+  return cleaned.length ? cleaned : [[]];
+};
+
+const EditableBlock = ({ block, selected, touched, editedLines, onSelect, onChange }) => {
+  const ref = useRef(null);
+  const initialHtml = touched && editedLines ? editedToHtml(editedLines) : editedToHtml(blockInitialLines(block));
+  useEffect(() => {
+    if (selected && ref.current && ref.current.dataset.init !== '1') {
+      ref.current.innerHTML = initialHtml;
+      ref.current.dataset.init = '1';
+      ref.current.focus();
+    }
+  }, [selected, initialHtml]);
+  const base = {
+    position: 'absolute', left: block.leftPx, top: block.topPx,
+    width: block.widthPx,
+    minHeight: Math.max(0, (block.nLines || 1) - 1) * (block.lineHeightPx || block.sizePx * 1.3) + block.sizePx * 1.25,
+    fontSize: block.sizePx * 0.92, lineHeight: `${block.lineHeightPx || block.sizePx * 1.3}px`,
+    fontFamily: famCss(block.family), color: block.color || '#0f172a',
+    textAlign: 'left', whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word',
+  };
+  if (selected) {
+    return (
+      <div ref={ref} contentEditable suppressContentEditableWarning data-testid="pdf-block-input"
+        onInput={() => onChange(parseEditable(ref.current))}
+        style={{ ...base, background: block.bg || '#fff', outline: '2px solid rgba(244,63,94,0.9)', borderRadius: 3, padding: '0 1px', zIndex: 30 }} />
+    );
+  }
+  if (touched) {
+    return (
+      <div onClick={onSelect} data-testid="pdf-block-touched"
+        style={{ ...base, background: block.bg || '#fff', cursor: 'text', borderRadius: 3, padding: '0 1px', zIndex: 12 }}
+        dangerouslySetInnerHTML={{ __html: editedToHtml(editedLines) }} />
+    );
+  }
+  return (
+    <div onClick={onSelect} data-testid="pdf-block" title="Click to edit"
+      className="hover:bg-rose-400/10"
+      style={{ ...base, color: 'transparent', cursor: 'text', border: '1px dashed rgba(244,63,94,0.45)', borderRadius: 3, zIndex: 8 }} />
+  );
+};
+
+
 const EditPdfPage = () => {
   const [file, setFile] = useState(null);
   const [docName, setDocName] = useState('');
@@ -68,6 +155,8 @@ const EditPdfPage = () => {
   const [loading, setLoading] = useState(false);
   const [edits, setEdits] = useState({});
   const [selectedId, setSelectedId] = useState(null);
+  const [blockEdits, setBlockEdits] = useState({}); // { [blockId]: { block, editedLines, touched } }
+  const [selectedBlockId, setSelectedBlockId] = useState(null);
   const [activeTab, setActiveTab] = useState('edit-text');
   const [zoom, setZoom] = useState(1);
   const [busy, setBusy] = useState(false);
@@ -103,6 +192,7 @@ const EditPdfPage = () => {
     setFile(f); setDocName(f.name || 'document.pdf');
     setPageIndex(0); setEdits({}); setSelectedId(null); setResult(null); setZoom(1);
     setObjects([]); setSelectedObjId(null);
+    setBlockEdits({}); setSelectedBlockId(null);
     // Ask the backend whether this PDF uses a legacy (non-Unicode) Hindi font.
     // Content-based auto-detection: convert Kruti/DevLys ASCII text to Unicode when
     // the font is a known legacy one, OR the text layer is non-empty yet has almost
@@ -130,7 +220,7 @@ const EditPdfPage = () => {
 
   const goPage = async (idx) => {
     if (idx === pageIndex || idx < 0 || idx >= total) return;
-    setSelectedId(null); setPageIndex(idx);
+    setSelectedId(null); setSelectedBlockId(null); setPageIndex(idx);
     await loadPage(file, idx, legacyHindi);
   };
 
@@ -141,6 +231,21 @@ const EditPdfPage = () => {
   };
 
   const patchText = (id, text) => setEdits((prev) => ({ ...prev, [id]: { ...prev[id], text, touched: true } }));
+
+  // ---- Block editing ----
+  const selectBlock = (b) => {
+    setActiveTab('edit-text');
+    setSelectedId(null);
+    setSelectedObjId(null);
+    setSelectedBlockId(b.id);
+    setBlockEdits((prev) => (prev[b.id] ? prev : { ...prev, [b.id]: { block: b, editedLines: blockInitialLines(b), touched: false } }));
+  };
+  const patchBlock = (id, editedLines) => setBlockEdits((prev) => ({ ...prev, [id]: { ...prev[id], editedLines, touched: true } }));
+  const resetBlock = (id) => {
+    setBlockEdits((prev) => { const n = { ...prev }; delete n[id]; return n; });
+    if (selectedBlockId === id) setSelectedBlockId(null);
+  };
+  const selectedBlockEntry = selectedBlockId ? blockEdits[selectedBlockId] : null;
   const patchStyle = (id, patch) => setEdits((prev) => ({ ...prev, [id]: { ...prev[id], style: { ...prev[id].style, ...patch }, touched: true } }));
   const resetOne = (id) => {
     setEdits((prev) => { const n = { ...prev }; delete n[id]; return n; });
@@ -149,9 +254,10 @@ const EditPdfPage = () => {
 
   const touchedList = Object.entries(edits).filter(([, e]) => e.touched);
   const editedCount = touchedList.length;
+  const touchedBlocks = Object.values(blockEdits).filter((e) => e.touched);
   // Don't count empty (not-yet-typed) text boxes toward the change counter.
   const activeObjCount = objects.filter((o) => o.kind !== 'text' || (o.text || '').trim()).length;
-  const changeCount = editedCount + activeObjCount;
+  const changeCount = editedCount + touchedBlocks.length + activeObjCount;
 
   // ---- Shapes & inserted images (movable objects) ----
   const addShape = (type) => {
@@ -246,33 +352,15 @@ const EditPdfPage = () => {
     if (!changeCount) return;
     setBusy(true); setError('');
     try {
-      const texts = touchedList.map(([id, e]) => {
-        const it = e.item;
-        // Same-line text runs to the RIGHT of the edited run — these get pushed
-        // forward/back on export so text reflows like normal typing.
-        const pageItems = pageItemsRef.current[e.pageIndex] || [];
-        const lineTol = Math.max(2, (it.sizePt || 10) * 0.5);
-        const followers = pageItems
-          .filter((o) => o.id !== it.id
-            && Math.abs(o.yPt - it.yPt) <= lineTol
-            && o.xPt > it.xPt + 1
-            && !(edits[o.id] && edits[o.id].touched))
-          .sort((a, b) => a.xPt - b.xPt)
-          .map((o) => ({
-            xPt: o.xPt, yPt: o.yPt, widthPt: o.widthPt, text: o.str,
-            size: Math.max(6, Math.round(o.sizePt)), color: o.color,
-            family: o.mono ? 'mono' : o.serif ? 'serif' : 'sans',
-            bold: !!o.bold, italic: !!o.italic,
-          }));
-        return {
-          pageIndex: e.pageIndex,
-          xPt: it.xPt, yPt: it.yPt, widthPt: it.widthPt, bg: it.bg,
-          text: e.text,
-          family: e.style.family, bold: e.style.bold, italic: e.style.italic,
-          underline: e.style.underline, size: e.style.size, color: e.style.color, align: e.style.align,
-          followers,
-        };
-      });
+      // Edited paragraph/line blocks -> re-flowed styled text on export.
+      const blocks = touchedBlocks.map((e) => ({
+        pageIndex: e.block.pageIndex,
+        xPt: e.block.xPt, firstBaselineYpt: e.block.firstBaselineYpt,
+        lineHeightPt: e.block.lineHeightPt, widthPt: e.block.widthPt,
+        size: e.block.size, nLines: e.block.nLines,
+        color: e.block.color, bg: e.block.bg, family: e.block.family,
+        lines: (e.editedLines || []).map((line) => line.map((s) => ({ text: s.text, bold: !!s.bold, italic: !!s.italic }))),
+      }));
       const shapes = objects.filter((o) => o.kind === 'shape').map((o) => ({ pageIndex: o.pageIndex, type: o.type, n: o.n, color: o.color, opacity: o.opacity, strokeWidth: o.strokeWidth, fill: o.fill }));
       const images = objects.filter((o) => o.kind === 'image').map((o) => ({ pageIndex: o.pageIndex, dataUrl: o.dataUrl, n: o.n }));
       // Brand-new text boxes -> text edits placed by normalized coords (no cover box).
@@ -290,7 +378,7 @@ const EditPdfPage = () => {
           size, color: o.color, align: o.align,
         };
       });
-      const bytes = await pdf.applyPdfEdits(file, { texts: [...texts, ...newTexts], shapes, images });
+      const bytes = await pdf.applyPdfEdits(file, { texts: newTexts, blocks, shapes, images });
       const name = (docName || 'document').replace(/\.pdf$/i, '') + '-edited.pdf';
       pdf.download(bytes, name);
       setResult({ name });
@@ -303,64 +391,45 @@ const EditPdfPage = () => {
   const scale = preview ? preview.pxW / preview.ptW : 1;
   const selectedEntry = selectedId ? edits[selectedId] : null;
 
+  const applyInlineFormat = (cmd) => {
+    if (typeof document !== 'undefined' && document.execCommand) {
+      document.execCommand(cmd, false, null);
+      if (selectedBlockId) {
+        const el = stageRef.current && stageRef.current.querySelector('[data-testid="pdf-block-input"]');
+        if (el) patchBlock(selectedBlockId, parseEditable(el));
+      }
+    }
+  };
+
   const renderEditTextPanel = () => {
-    if (!selectedEntry) {
+    if (!selectedBlockEntry) {
       return (
         <div className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
           <div className="grid place-items-center w-12 h-12 rounded-xl bg-rose-500/10 text-rose-500 mb-3"><MousePointerClick className="w-6 h-6" /></div>
-          Click any text on the page to select it. Then change its words, font, size, colour, weight and alignment here.
+          Click any dashed <span className="font-semibold text-rose-500">text block</span> on the page to edit it inline. Type directly on the page — the paragraph re-flows to fit, and any <b>bold</b> words stay bold.
         </div>
       );
     }
-    const st = selectedEntry.style;
-    const id = selectedId;
     return (
       <div className="space-y-4">
-        <div>
-          <label className="block text-xs font-semibold text-slate-500 mb-1.5">Text</label>
-          <textarea value={selectedEntry.text} onChange={(e) => patchText(id, e.target.value)} rows={2}
-            className="w-full rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-white/5 px-3 py-2 text-sm outline-none focus:border-rose-400" />
+        <div className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300 bg-rose-50/60 dark:bg-rose-500/[0.06] border border-rose-100 dark:border-rose-500/20 rounded-lg px-3 py-2.5">
+          <Type className="w-4 h-4 text-rose-500 shrink-0" />
+          Editing on the page. Select words below and toggle bold / italic.
         </div>
         <div>
-          <label className="block text-xs font-semibold text-slate-500 mb-1.5">Font</label>
-          <select value={st.family} onChange={(e) => patchStyle(id, { family: e.target.value })}
-            className="w-full rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-white/5 px-3 py-2 text-sm outline-none focus:border-rose-400">
-            {FAMILIES.map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}
-          </select>
-        </div>
-        <div className="flex items-end gap-3">
-          <div className="flex-1">
-            <label className="block text-xs font-semibold text-slate-500 mb-1.5">Size</label>
-            <div className="flex items-center rounded-lg border border-slate-200 dark:border-white/10 overflow-hidden">
-              <button type="button" onClick={() => patchStyle(id, { size: Math.max(6, st.size - 1) })} className="px-2.5 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-white/5"><Minus className="w-4 h-4" /></button>
-              <input type="number" min={6} max={200} value={st.size} onChange={(e) => patchStyle(id, { size: Math.max(6, Math.min(200, parseInt(e.target.value || '0', 10) || 6)) })}
-                className="w-full text-center text-sm bg-transparent outline-none py-2" />
-              <button type="button" onClick={() => patchStyle(id, { size: Math.min(200, st.size + 1) })} className="px-2.5 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-white/5"><Plus className="w-4 h-4" /></button>
-            </div>
-          </div>
-          <div>
-            <label className="block text-xs font-semibold text-slate-500 mb-1.5">Colour</label>
-            <input type="color" value={st.color} onChange={(e) => patchStyle(id, { color: e.target.value })}
-              className="w-11 h-10 rounded-lg border border-slate-200 dark:border-white/10 bg-white cursor-pointer" />
-          </div>
-        </div>
-        <div>
-          <label className="block text-xs font-semibold text-slate-500 mb-1.5">Style</label>
+          <label className="block text-xs font-semibold text-slate-500 mb-1.5">Format selected words</label>
           <div className="flex gap-2">
-            <StyleToggle active={st.bold} onClick={() => patchStyle(id, { bold: !st.bold })} title="Bold"><Bold className="w-4 h-4" /></StyleToggle>
-            <StyleToggle active={st.italic} onClick={() => patchStyle(id, { italic: !st.italic })} title="Italic"><Italic className="w-4 h-4" /></StyleToggle>
-            <StyleToggle active={st.underline} onClick={() => patchStyle(id, { underline: !st.underline })} title="Underline"><Underline className="w-4 h-4" /></StyleToggle>
+            <button type="button" data-testid="block-bold-btn" title="Bold selected text"
+              onMouseDown={(e) => e.preventDefault()} onClick={() => applyInlineFormat('bold')}
+              className="grid place-items-center w-9 h-9 rounded-lg border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5"><Bold className="w-4 h-4" /></button>
+            <button type="button" data-testid="block-italic-btn" title="Italicise selected text"
+              onMouseDown={(e) => e.preventDefault()} onClick={() => applyInlineFormat('italic')}
+              className="grid place-items-center w-9 h-9 rounded-lg border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5"><Italic className="w-4 h-4" /></button>
           </div>
+          <p className="text-xs text-slate-400 mt-1.5">Tip: highlight the words first, then tap B or I.</p>
         </div>
-        <div>
-          <label className="block text-xs font-semibold text-slate-500 mb-1.5">Alignment</label>
-          <div className="flex gap-2">
-            <StyleToggle active={st.align === 'left'} onClick={() => patchStyle(id, { align: 'left' })} title="Align left"><AlignLeft className="w-4 h-4" /></StyleToggle>
-            <StyleToggle active={st.align === 'center'} onClick={() => patchStyle(id, { align: 'center' })} title="Align center"><AlignCenter className="w-4 h-4" /></StyleToggle>
-            <StyleToggle active={st.align === 'right'} onClick={() => patchStyle(id, { align: 'right' })} title="Align right"><AlignRight className="w-4 h-4" /></StyleToggle>
-          </div>
-        </div>
-        <button type="button" onClick={() => resetOne(id)} className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-500 hover:text-rose-500"><RotateCcw className="w-4 h-4" /> Reset this text</button>
+        <button type="button" data-testid="block-reset-btn" onClick={() => resetBlock(selectedBlockId)}
+          className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-500 hover:text-rose-500"><RotateCcw className="w-4 h-4" /> Reset this block</button>
       </div>
     );
   };
@@ -592,7 +661,7 @@ const EditPdfPage = () => {
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400 bg-slate-50 dark:bg-white/[0.03] border border-slate-200 dark:border-white/10 rounded-xl px-4 py-2.5 mb-3">
                 <MousePointerClick className="w-4 h-4 text-rose-500 shrink-0" />
-                Click any highlighted text to edit and restyle it. Changes save into a fresh PDF.
+                Click any dashed text block to edit it inline. Text re-flows to fit and bold stays bold. Saves into a fresh PDF.
               </div>
               <div className="rounded-2xl border border-slate-200 dark:border-white/10 bg-slate-100 dark:bg-black/20 overflow-auto h-[68vh] grid place-items-start justify-center p-6">
                 {loading || !preview ? (
@@ -600,59 +669,24 @@ const EditPdfPage = () => {
                 ) : (
                   <div style={{ width: preview.pxW * zoom, height: preview.pxH * zoom }}>
                     <div ref={stageRef} style={{ transform: `scale(${zoom})`, transformOrigin: 'top left', width: preview.pxW, height: preview.pxH }}
-                      className="relative bg-white shadow-xl" onClick={(e) => { if (e.target === e.currentTarget) { setSelectedId(null); setSelectedObjId(null); } }}>
+                      className="relative bg-white shadow-xl" onClick={(e) => { if (e.target === e.currentTarget) { setSelectedId(null); setSelectedObjId(null); setSelectedBlockId(null); } }}>
                       <img src={preview.dataUrl} alt={`page ${pageIndex + 1}`} className="block select-none pointer-events-none" style={{ width: preview.pxW, height: preview.pxH }} draggable={false} />
-                      {preview.items.map((it) => {
-                        const entry = edits[it.id];
-                        const st = entry ? entry.style : deriveStyle(it);
-                        const text = entry ? entry.text : it.str;
-                        const active = selectedId === it.id || (entry && entry.touched);
-                        // Keep the on-page glyph size IDENTICAL to the original when
-                        // the user hasn't manually changed the size: st.size starts as
-                        // the rounded point size, so scale the exact original pixel
-                        // height (it.fontPx) by (current size / baseline size). When
-                        // unchanged this factor is 1 -> no size jump on click/edit.
-                        const baseSize = Math.max(6, Math.round(it.sizePt));
-                        // Keep the edited glyph at its ORIGINAL size. When the text
-                        // grows, the box grows and the following text reflows to the
-                        // right on export — just like normal typing (no shrinking).
-                        const fontPx = it.fontPx * (st.size / baseSize);
-                        const baselinePx = it.top + it.fontPx;
-                        const top = baselinePx - fontPx;
-                        if (active) {
-                          const measured = measureTextWidthPx(text, fontPx * 0.92, st) + 8;
-                          const w = Math.max(it.widthPx, fontPx, measured, 14);
-                          return (
-                            <input key={it.id} value={text} data-testid="pdf-text-input"
-                              onChange={(e) => patchText(it.id, e.target.value)}
-                              onFocus={() => selectItem(it)}
-                              spellCheck={false}
-                              style={{
-                                position: 'absolute', left: it.left, top,
-                                width: w, height: fontPx * 1.32,
-                                fontFamily: famCss(st.family), fontSize: fontPx * 0.92,
-                                lineHeight: `${fontPx * 1.32}px`,
-                                fontWeight: st.bold ? 700 : 400, fontStyle: st.italic ? 'italic' : 'normal',
-                                textDecoration: st.underline ? 'underline' : 'none',
-                                textAlign: st.align, color: st.color, background: it.bg,
-                                border: selectedId === it.id ? '1px solid rgba(244,63,94,0.9)' : '1px dashed rgba(244,63,94,0.45)',
-                                borderRadius: 3, padding: 0, paddingLeft: 1, outline: 'none',
-                                boxSizing: 'content-box', zIndex: selectedId === it.id ? 30 : 10,
-                              }} />
-                          );
-                        }
+                      {(preview.blocks || []).map((b) => {
+                        const be = blockEdits[b.id];
+                        const touched = be && be.touched;
+                        const selected = selectedBlockId === b.id;
+                        // Outside Edit-Text tab, only keep already-edited blocks visible.
+                        if (activeTab !== 'edit-text' && !touched) return null;
                         return (
-                          <div key={it.id} onClick={() => selectItem(it)} title="Click to edit" data-testid="pdf-text-run"
-                            style={{
-                              position: 'absolute', left: it.left, top: it.top,
-                              width: it.widthPx, height: it.fontPx * 1.25,
-                              fontSize: it.fontPx * 0.92, lineHeight: `${it.fontPx * 1.25}px`,
-                              fontFamily: famCss(st.family), color: 'transparent',
-                              cursor: 'text', borderRadius: 3, whiteSpace: 'pre', overflow: 'hidden',
-                            }}
-                            className="hover:bg-rose-400/20 hover:outline hover:outline-1 hover:outline-rose-400/60">
-                            {it.str}
-                          </div>
+                          <EditableBlock
+                            key={b.id + (selected ? '-sel' : '')}
+                            block={b}
+                            selected={selected}
+                            touched={!!touched}
+                            editedLines={be ? be.editedLines : null}
+                            onSelect={() => selectBlock(b)}
+                            onChange={(lines) => patchBlock(b.id, lines)}
+                          />
                         );
                       })}
                       {objects.filter((o) => o.pageIndex === pageIndex).map((o) => {
