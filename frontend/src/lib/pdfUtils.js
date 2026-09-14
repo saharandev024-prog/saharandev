@@ -506,10 +506,14 @@ export const extractPageText = async (file, pageIndex = 0, previewWidth = 720) =
       str: it.str,
       // preview-space (CSS px over the rendered image)
       left, top, widthPx, fontPx,
-      // pdf-space (points, origin bottom-left) for export
+      // pdf-space (points, origin bottom-left) for export.
+      // Use the TRUE rendered height (fontPx / scale) for the point size — some
+      // runs are horizontally condensed (transform[0] << transform[3]), and
+      // reading the x-scale would give a too-small size, so the edit is drawn
+      // tiny and its cover box fails to hide the original glyphs.
       xPt: it.transform[4],
       yPt: it.transform[5],
-      sizePt: Math.hypot(it.transform[0], it.transform[1]) || (fontPx / scale),
+      sizePt: (fontPx / scale) || Math.hypot(it.transform[0], it.transform[1]),
       widthPt: it.width || 0,
       color, bg,
       bold: cls.bold, italic: cls.italic, serif: cls.serif, mono: cls.mono,
