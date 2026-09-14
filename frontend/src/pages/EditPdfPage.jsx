@@ -79,6 +79,7 @@ const EditPdfPage = () => {
   const stageRef = useRef(null);
   const objDrag = useRef(null);
   const imgInputRef = useRef(null);
+  const pageItemsRef = useRef({}); // { [pageIndex]: items[] } for reflow of same-line text
 
   const loadPage = useCallback(async (f, idx, convert = false) => {
     setLoading(true); setError('');
@@ -90,6 +91,7 @@ const EditPdfPage = () => {
         p.items = p.items.map((it) => ({ ...it, str: krutiToUnicode(it.str) }));
       }
       setPreview(p); setTotal(p.total);
+      pageItemsRef.current[idx] = p.items || [];
     } catch (e) {
       setError('Could not read this PDF. It may be scanned (image-only) or password protected.');
     }
@@ -244,13 +246,33 @@ const EditPdfPage = () => {
     if (!changeCount) return;
     setBusy(true); setError('');
     try {
-      const texts = touchedList.map(([, e]) => ({
-        pageIndex: e.pageIndex,
-        xPt: e.item.xPt, yPt: e.item.yPt, widthPt: e.item.widthPt, bg: e.item.bg,
-        text: e.text,
-        family: e.style.family, bold: e.style.bold, italic: e.style.italic,
-        underline: e.style.underline, size: e.style.size, color: e.style.color, align: e.style.align,
-      }));
+      const texts = touchedList.map(([id, e]) => {
+        const it = e.item;
+        // Same-line text runs to the RIGHT of the edited run — these get pushed
+        // forward/back on export so text reflows like normal typing.
+        const pageItems = pageItemsRef.current[e.pageIndex] || [];
+        const lineTol = Math.max(2, (it.sizePt || 10) * 0.5);
+        const followers = pageItems
+          .filter((o) => o.id !== it.id
+            && Math.abs(o.yPt - it.yPt) <= lineTol
+            && o.xPt > it.xPt + 1
+            && !(edits[o.id] && edits[o.id].touched))
+          .sort((a, b) => a.xPt - b.xPt)
+          .map((o) => ({
+            xPt: o.xPt, yPt: o.yPt, widthPt: o.widthPt, text: o.str,
+            size: Math.max(6, Math.round(o.sizePt)), color: o.color,
+            family: o.mono ? 'mono' : o.serif ? 'serif' : 'sans',
+            bold: !!o.bold, italic: !!o.italic,
+          }));
+        return {
+          pageIndex: e.pageIndex,
+          xPt: it.xPt, yPt: it.yPt, widthPt: it.widthPt, bg: it.bg,
+          text: e.text,
+          family: e.style.family, bold: e.style.bold, italic: e.style.italic,
+          underline: e.style.underline, size: e.style.size, color: e.style.color, align: e.style.align,
+          followers,
+        };
+      });
       const shapes = objects.filter((o) => o.kind === 'shape').map((o) => ({ pageIndex: o.pageIndex, type: o.type, n: o.n, color: o.color, opacity: o.opacity, strokeWidth: o.strokeWidth, fill: o.fill }));
       const images = objects.filter((o) => o.kind === 'image').map((o) => ({ pageIndex: o.pageIndex, dataUrl: o.dataUrl, n: o.n }));
       // Brand-new text boxes -> text edits placed by normalized coords (no cover box).
@@ -591,23 +613,15 @@ const EditPdfPage = () => {
                         // height (it.fontPx) by (current size / baseline size). When
                         // unchanged this factor is 1 -> no size jump on click/edit.
                         const baseSize = Math.max(6, Math.round(it.sizePt));
-                        // Shrink-to-fit: keep the edited run on its ORIGINAL single
-                        // line by scaling the glyph size down so the (possibly longer
-                        // or wider) text fits its original box width. This mirrors the
-                        // export so the following text never gets overlapped.
-                        let fontPx = it.fontPx * (st.size / baseSize);
-                        const boxW = Math.max(it.widthPx, 14);
-                        if (text) {
-                          let mw = measureTextWidthPx(text, fontPx * 0.92, st);
-                          while (mw > boxW && fontPx > 4) {
-                            fontPx -= 0.5;
-                            mw = measureTextWidthPx(text, fontPx * 0.92, st);
-                          }
-                        }
+                        // Keep the edited glyph at its ORIGINAL size. When the text
+                        // grows, the box grows and the following text reflows to the
+                        // right on export — just like normal typing (no shrinking).
+                        const fontPx = it.fontPx * (st.size / baseSize);
                         const baselinePx = it.top + it.fontPx;
                         const top = baselinePx - fontPx;
                         if (active) {
-                          const w = Math.max(boxW, fontPx, 14);
+                          const measured = measureTextWidthPx(text, fontPx * 0.92, st) + 8;
+                          const w = Math.max(it.widthPx, fontPx, measured, 14);
                           return (
                             <input key={it.id} value={text} data-testid="pdf-text-input"
                               onChange={(e) => patchText(it.id, e.target.value)}

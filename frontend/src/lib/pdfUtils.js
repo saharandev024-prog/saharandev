@@ -665,6 +665,14 @@ export const applyPdfEdits = async (file, { texts = [], shapes = [], images = []
   const px = (n, ptW, ptH) => ({ x: n.x * ptW, w: n.w * ptW, h: n.h * ptH, y: ptH - n.y * ptH - n.h * ptH });
   const getUniFont = makeUnicodeFontGetter(docPdf);
 
+  const drawTextSafe = async (page, str, x, y, size, font, col) => {
+    try { page.drawText(str, { x, y, size, font, color: col }); }
+    catch {
+      try { const uni = await getUniFont(); page.drawText(str, { x, y, size, font: uni, color: col }); }
+      catch { page.drawText(str.replace(/[^\x20-\x7E]/g, '?'), { x, y, size, font, color: col }); }
+    }
+  };
+
   for (const e of texts) {
     const page = pages[e.pageIndex];
     if (!page) continue;
@@ -672,38 +680,60 @@ export const applyPdfEdits = async (file, { texts = [], shapes = [], images = []
     const font = needsUnicodeFont(text) ? await getUniFont() : await pick(e);
     const measure = (t, sz) => { try { return font.widthOfTextAtSize(t, sz); } catch { return t.length * sz * 0.5; } };
     let size = e.size || 12;
-    // Existing edited runs (with a cover box) shrink-to-fit on one line so they
-    // don't overlap the following text; brand-new free text boxes keep wrapping.
-    const boxW = e.widthPt && e.widthPt > 1 ? e.widthPt : measure(text, size);
-    let lines;
+
+    // --- Brand-new free text boxes: keep original size, wrap onto extra lines ---
     if (e.noBg) {
-      lines = wrapTextToWidth(text, measure, size, boxW);
-    } else {
-      size = fitSizeToWidth(text, measure, size, boxW);
-      lines = [String(text == null ? '' : text).replace(/\n/g, ' ')];
-    }
-    const lineHeight = size * 1.32;
-    const lineWidths = lines.map((l) => measure(l, size));
-    const maxLineW = Math.max(0, ...lineWidths);
-    const left = e.xPt - 1;
-    const right = Math.max(e.xPt + boxW, e.xPt + maxLineW) + 1;
-    // Skip the cover rectangle for brand-new text boxes (noBg) so they don't
-    // paint an opaque box over existing page content.
-    if (!e.noBg) page.drawRectangle({ x: left, y: e.yPt - size * 0.30 - (lines.length - 1) * lineHeight, width: right - left, height: size * 1.34 + (lines.length - 1) * lineHeight, color: hexToRgb(e.bg) });
-    const col = hexToRgb(e.color);
-    for (let li = 0; li < lines.length; li++) {
-      const str = lines[li];
-      const w = lineWidths[li];
-      const y = e.yPt - li * lineHeight;
-      let drawX = e.xPt;
-      if (e.align === 'center') drawX = e.xPt + (boxW - w) / 2;
-      else if (e.align === 'right') drawX = e.xPt + (boxW - w);
-      try { page.drawText(str, { x: drawX, y, size, font, color: col }); }
-      catch {
-        try { const uni = await getUniFont(); page.drawText(str, { x: drawX, y, size, font: uni, color: col }); }
-        catch { page.drawText(str.replace(/[^\x20-\x7E]/g, '?'), { x: drawX, y, size, font, color: col }); }
+      const boxW = e.widthPt && e.widthPt > 1 ? e.widthPt : measure(text, size);
+      const lines = wrapTextToWidth(text, measure, size, boxW);
+      const lineHeight = size * 1.32;
+      const col = hexToRgb(e.color);
+      for (let li = 0; li < lines.length; li++) {
+        const str = lines[li];
+        const w = measure(str, size);
+        const y = e.yPt - li * lineHeight;
+        let drawX = e.xPt;
+        if (e.align === 'center') drawX = e.xPt + (boxW - w) / 2;
+        else if (e.align === 'right') drawX = e.xPt + (boxW - w);
+        await drawTextSafe(page, str, drawX, y, size, font, col);
+        if (e.underline) page.drawRectangle({ x: drawX, y: y - size * 0.12, width: w, height: Math.max(0.6, size * 0.06), color: col });
       }
-      if (e.underline) page.drawRectangle({ x: drawX, y: y - size * 0.12, width: w, height: Math.max(0.6, size * 0.06), color: col });
+      continue;
+    }
+
+    // --- Existing edited run: keep ORIGINAL size on one line and reflow the
+    // same-line text after it (followers) left/right, like normal typing. ---
+    const single = String(text == null ? '' : text).replace(/\n/g, ' ');
+    const boxW = e.widthPt && e.widthPt > 1 ? e.widthPt : measure(single, size);
+    const newW = measure(single, size);
+    const shift = newW - boxW; // >0 grows (push right), <0 shrinks (pull left)
+    const followers = Array.isArray(e.followers) ? e.followers : [];
+
+    // Cover the whole affected span (edited run + followers, at both their old
+    // and new positions) with the sampled background before redrawing.
+    const fRightOrig = followers.map((f) => f.xPt + (f.widthPt || 0));
+    const fRightNew = followers.map((f) => f.xPt + shift + (f.widthPt || 0));
+    const coverRight = Math.max(e.xPt + boxW, e.xPt + newW, 0, ...fRightOrig, ...fRightNew) + 2;
+    const coverSize = Math.max(size, 0, ...followers.map((f) => f.size || 0));
+    const coverLeft = e.xPt - 1;
+    page.drawRectangle({
+      x: coverLeft,
+      y: e.yPt - coverSize * 0.30,
+      width: coverRight - coverLeft,
+      height: coverSize * 1.34,
+      color: hexToRgb(e.bg),
+    });
+
+    // Draw the edited text at its original left, original size.
+    const col = hexToRgb(e.color);
+    await drawTextSafe(page, single, e.xPt, e.yPt, size, font, col);
+    if (e.underline) page.drawRectangle({ x: e.xPt, y: e.yPt - size * 0.12, width: newW, height: Math.max(0.6, size * 0.06), color: col });
+
+    // Redraw each follower shifted by the width delta, in its own style.
+    for (const f of followers) {
+      const ftext = f.text || '';
+      if (!ftext) continue;
+      const ffont = needsUnicodeFont(ftext) ? await getUniFont() : await pick(f);
+      await drawTextSafe(page, ftext, f.xPt + shift, f.yPt, f.size || size, ffont, hexToRgb(f.color));
     }
   }
 
